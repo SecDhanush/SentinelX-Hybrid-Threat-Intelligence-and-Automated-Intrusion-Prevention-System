@@ -1,6 +1,8 @@
 
 # SentinelX: Hybrid Threat Intelligence and Automated Intrusion Prevention Architecture
 
+![SentinelX Architecture](file_00000000a82c71f8b6f4e84a5d...)
+
 ### *Autonomous Detection. Intelligent Analysis. Instant Protection.*
 
 ---
