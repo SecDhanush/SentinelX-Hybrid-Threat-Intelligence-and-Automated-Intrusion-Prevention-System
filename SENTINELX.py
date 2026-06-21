@@ -1,0 +1,1305 @@
+import subprocess
+import json
+import time
+import os
+import re
+import threading
+import hmac
+import hashlib
+import secrets
+from datetime import datetime, timedelta
+import urllib.request
+import shutil  
+import signal
+import sys
+import logging
+
+# ==========================================
+# CENTRALIZED AUDIT ENVIRONMENT LOGGER
+# ==========================================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - [SENTINELX-AUDIT] - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("sentinelx_security_audit.log", mode="a")
+    ]
+)
+
+# =========================
+# CONFIG
+# =========================
+
+gateway_ip = "192.168.1.1"
+real_mac = "08:00:27:78:c2:cd".lower()
+interface = "enp0s3"
+
+pfsense_ip = "192.168.1.1"
+pfsense_user = "root"
+
+ssh_key = "/home/vboxuser/.ssh/pfsense_key"
+pool_switch_script = "/root/pool_switch.sh"
+
+LOG_FILE = "/home/vboxuser/Desktop/sentinelx.log"
+DB_FILE = "attacker_db.json"
+BACKUP_FILE = "attacker_db_backup.json" 
+SIG_FILE = "attacker_db.sig"
+KEY_FILE = "secret.key"
+API_KEY_FILE = "abuseipdb.key"  
+STATE_FILE = "sentinelx_state.json"  
+
+MONITOR_INTERVAL = 3
+ATTACK_COOLDOWN = 15
+VERIFY_DELAY = 3
+LOCK_DELAY = 2
+DHCP_DELAY = 6
+IDS_RECONNECT_DELAY = 5
+
+# =========================
+# BLOCK SETTINGS
+# =========================
+
+TEMP_BLOCK_TIME = 300
+PERMANENT_BLOCK_SCORE = 20
+
+blocked_ips = set()
+blocked_macs = set()
+ignored_attackers = set()
+
+alert_tracker = {}
+pool_switch_running = False
+arp_recovery_mode = False
+
+volatile_temp_blocks = {} 
+volatile_score_history = {}
+
+# =================================================================
+# GLOBAL UI STATE CONTROL (PREVENTS STARTUP LOG OVERLAP)
+# =================================================================
+dashboard_fully_drawn = False
+
+# =================================================================
+# ANALYST THREAT MATRIX MODEL (CUSTOM THRESHOLDS & JUDICIAL SCORES)
+# =================================================================
+
+THREAT_MATRIX = {
+    "SSH BRUTEFORCE":     {"weight": 20, "severity": 3, "threat": "HIGH"},
+    "FTP BRUTEFORCE":     {"weight": 20, "severity": 3, "threat": "HIGH"},
+    "RDP BRUTEFORCE":     {"weight": 20, "severity": 3, "threat": "HIGH"},
+    "TELNET BRUTEFORCE":  {"weight": 20, "severity": 3, "threat": "HIGH"},
+    "SMB ATTACK":         {"weight": 20, "severity": 3, "threat": "HIGH"},
+    "MYSQL ATTACK":       {"weight": 20, "severity": 3, "threat": "HIGH"},
+    "POSTGRESQL ATTACK":  {"weight": 20, "severity": 3, "threat": "HIGH"},
+    "MONGODB ATTACK":     {"weight": 20, "severity": 3, "threat": "HIGH"},
+    "REDIS ATTACK":       {"weight": 20, "severity": 3, "threat": "HIGH"},
+    "VNC ATTACK":         {"weight": 20, "severity": 3, "threat": "HIGH"},
+    "SMTP ATTACK":        {"weight": 20, "severity": 3, "threat": "HIGH"},
+    
+    "TCP SYN SCAN":       {"weight": 4,  "severity": 1, "threat": "LOW"},
+    "ICMP SCAN":          {"weight": 4,  "severity": 1, "threat": "LOW"},
+    "PORT SCAN":          {"weight": 4,  "severity": 1, "threat": "LOW"},
+    "HTTP SCAN":          {"weight": 4,  "severity": 1, "threat": "LOW"},
+    "DNS TUNNELING":      {"weight": 5,  "severity": 2, "threat": "MEDIUM"}
+}
+
+# =========================
+# THREAD LOCKS
+# =========================
+
+db_lock = threading.Lock()
+block_lock = threading.Lock()
+
+# =================================================================
+# STATE & SYSTEM EMERGENCY SIGNAL MANAGEMENT
+# =================================================================
+
+def save_current_state(current_pool):
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump({"active_pool": current_pool}, f)
+    except Exception as e:
+        log(f"[WARN] State tracking write error: {e}")
+
+def load_previous_state():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                return json.load(f).get("active_pool", "Pool A")
+        except:
+            return "Pool A"
+    return "Pool A"
+
+def clean_system_flush_handler(signum, frame):
+    print("\n\033[91m[SYSTEM-RESET] Emergency Termination Intercepted! Resetting pipeline states...\033[0m")
+    try:
+        os.system("sudo iptables -F")
+        log("[INFO] Clean OS core flush complete. Local network states returned to normal baseline.")
+    except Exception as e:
+        print(f"[ERROR] Rule Flush Error: {e}")
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, clean_system_flush_handler)   
+signal.signal(signal.SIGTSTP, clean_system_flush_handler)  
+
+# =========================
+# SECURE CREDENTIAL LOADER
+# =========================
+
+def load_osint_key():
+    if not os.path.exists(API_KEY_FILE):
+        with open(API_KEY_FILE, "w") as f:
+            f.write("PASTE_YOUR_API_KEY_HERE")
+        os.chmod(API_KEY_FILE, 0o600)
+        log(f"[INFO] Created secure template '{API_KEY_FILE}'. Update it with your real key.")
+        return None
+        
+    try:
+        os.chmod(API_KEY_FILE, 0o600)
+        with open(API_KEY_FILE, "r") as f:
+            key = f.read().strip()
+            if key == "PASTE_YOUR_API_KEY_HERE" or not key:
+                return None
+            return key
+    except Exception as e:
+        log(f"[SEC-ERR-01] Secure Key Load Error: {e}")
+        return None
+
+# =======================================================================
+# PRIVILEGED OS LEVEL SECURITY LAYER (UPGRADED)
+# =======================================================================
+def enforce_file_security(filepath):
+    try:
+        if os.path.exists(filepath):
+            os.chmod(filepath, 0o600)
+    except Exception as e:
+        logging.warning(f"Could not bind secure administrative locks on file {filepath}: {e}")
+
+# =========================
+# HMAC INTEGRITY
+# =========================
+
+def get_secret_key():
+    if not os.path.exists(KEY_FILE):  
+        key = secrets.token_hex(32)  
+        with open(KEY_FILE, "w") as f:  
+            f.write(key)  
+        os.chmod(KEY_FILE, 0o600)  
+    with open(KEY_FILE, "r") as f:  
+        return f.read().strip()
+
+def generate_hmac_for_file(filepath, signature_path):
+    if not os.path.exists(filepath):  
+        return  
+    key = get_secret_key().encode()  
+    with open(filepath, "rb") as f:  
+        data = f.read()  
+    signature = hmac.new(  
+        key,  
+        data,  
+        hashlib.sha256  
+    ).hexdigest()  
+    with open(signature_path, "w") as f:  
+        f.write(signature)  
+        f.flush()  
+        os.fsync(f.fileno())
+
+def generate_hmac():
+    generate_hmac_for_file(DB_FILE, SIG_FILE)
+
+def verify_file_hmac(filepath, signature_path):
+    if not os.path.exists(filepath) and not os.path.exists(signature_path):  
+        return True  
+    if not os.path.exists(filepath) or not os.path.exists(signature_path):  
+        return False  
+    key = get_secret_key().encode()  
+    with open(filepath, "rb") as f:  
+        data = f.read()  
+    current_sig = hmac.new(  
+        key,  
+        data,  
+        hashlib.sha256  
+    ).hexdigest()  
+    with open(signature_path, "r") as f:  
+        stored_sig = f.read().strip()  
+    return hmac.compare_digest(current_sig, stored_sig)
+
+def verify_hmac():
+    return verify_file_hmac(DB_FILE, SIG_FILE)
+
+def check_db_integrity_status():
+    if not os.path.exists(DB_FILE):
+        return "NO_DB_YET"
+    if verify_hmac():
+        return "SAFE"
+    else:
+        return "TAMPERED"
+
+# =========================
+# LOGGER (MODIFIED FOR UI PROTECTION)
+# =========================
+
+def log(msg):
+    global dashboard_fully_drawn
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")  
+    final = f"[{timestamp}] {msg}"  
+    
+    if dashboard_fully_drawn:
+        if not any(x in msg for x in ["Gateway MAC Safe", "IDS/IPS Engine Started", "Monitoring Feed Stream"]):
+            print(final)  
+            sys.stdout.flush()
+            
+    with open(LOG_FILE, "a") as f:  
+        f.write(final + "\n")
+
+# =========================
+# GET OWN IP
+# =========================
+
+def get_own_ip():
+    try:  
+        output = subprocess.check_output(  
+            ["hostname", "-I"]  
+        ).decode().strip()  
+        return output.split()[0]  
+    except:  
+        return None
+
+# =======================================================================
+# REMOTE PFSENSE TABLE FETCH AUXILIARY ENGINE
+# =======================================================================
+
+def fetch_pfsense_table_ips():
+    try:
+        cmd = f"ssh -i {ssh_key} -o StrictHostKeyChecking=no {pfsense_user}@{pfsense_ip} 'pfctl -t attackers -T show'"
+        output = subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.DEVNULL)
+        active_ips = set()
+        for line in output.splitlines():
+            ip = line.strip()
+            if ip:
+                active_ips.add(ip)
+        return active_ips
+    except Exception as e:
+        return None
+
+# =======================================================================
+# NO-EMOJI CLEAN DASHBOARD METRIC ALIGNMENT ENGINE
+# =======================================================================
+
+def print_dashboard_metric_line(label, val, col1_w, col2_w):
+    clean_val = re.sub(r'[^\x00-\x7F]+', '', val).strip()
+    len_check = re.sub(r'\033\[[0-9;]*m', '', clean_val)
+    raw_len = len(len_check)
+    
+    needed_padding = col2_w - raw_len - 1
+    if needed_padding < 0:
+        needed_padding = 0
+
+    if any(x in clean_val for x in ["LOADED", "SAFE", "Complete", "Started", "Active", "Ready", "RESTORED", "aligned"]):
+        color_val = f"\033[92m{clean_val}\033[0m"
+    elif any(x in clean_val for x in ["ACTIVE", "Continuing", "Monitoring"]):
+        color_val = f"\033[96m{clean_val}\033[0m"
+    elif "Engaged" in clean_val:
+        color_val = f"\033[93m{clean_val}\033[0m"
+    elif any(x in clean_val for x in ["Failure", "TAMPERED", "Unreachable"]):
+        color_val = f"\033[91m{clean_val}\033[0m"
+    elif "NO_DB_YET" in clean_val:
+        color_val = f"\033[95m{clean_val}\033[0m"
+    else:
+        color_val = f"\033[97m{clean_val}\033[0m"
+
+    print(f"\033[93m│ \033[94m{label:<{col1_w-2}}\033[93m │ {color_val}{' ' * needed_padding}\033[93m│")
+
+# =======================================================================
+# SUBSHELL STARTER LOG INTEGRATION (SILENCED EXTRA SUBPROCESS OUTPUT)
+# =======================================================================
+
+def load_blocked_ips_dashboard(col1_w, col2_w):
+    global blocked_ips, volatile_temp_blocks
+    pfsense_table_ips = fetch_pfsense_table_ips()
+    
+    if pfsense_table_ips is None:
+        print_dashboard_metric_line("  STARTUP SYNC RUNTIME", "Failure: pfSense Firewall Table Unreachable", col1_w, col2_w)
+        return False
+
+    for ip in pfsense_table_ips:
+        blocked_ips.add(ip)
+    
+    print_dashboard_metric_line("  FIREWALL RECOVERY INJECT", f"Loaded {len(pfsense_table_ips)} active IPs from pfSense", col1_w, col2_w)
+    
+    with db_lock:
+        db = load_db()
+        restore_count = 0
+        temp_sync_count = 0
+        current_time = datetime.now()
+        
+        for ip, data in db.items():
+            b_type = data.get("block_type")
+            status = data.get("status")
+            b_until = data.get("blocked_until")
+            
+            if b_type == "PERMANENT" and status == "BLOCKED":
+                if ip not in pfsense_table_ips:
+                    restore_cmd = f"ssh -i {ssh_key} -o StrictHostKeyChecking=no {pfsense_user}@{pfsense_ip} 'pfctl -t attackers -T add {ip} && pfctl -k {ip} && pfctl -k 0.0.0.0/0 -k {ip}'"
+                    subprocess.run(restore_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    blocked_ips.add(ip)
+                    restore_count += 1
+                    time.sleep(0.1)
+            
+            elif b_type == "TEMPORARY" and status == "BLOCKED" and b_until:
+                unblock_time = datetime.strptime(b_until, "%Y-%m-%d %H:%M:%S")
+                if unblock_time > current_time:
+                    volatile_temp_blocks[ip] = b_until
+                    temp_sync_count += 1
+                    if ip not in pfsense_table_ips:
+                        restore_cmd = f"ssh -i {ssh_key} -o StrictHostKeyChecking=no {pfsense_user}@{pfsense_ip} 'pfctl -t attackers -T add {ip} && pfctl -k {ip} && pfctl -k 0.0.0.0/0 -k {ip}'"
+                        subprocess.run(restore_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        blocked_ips.add(ip)
+                        time.sleep(0.1)
+                else:
+                    data["status"] = "UNBLOCKED"
+                    data["block_type"] = "NONE"
+                    data["blocked_until"] = None
+        
+        if temp_sync_count > 0:
+            print_dashboard_metric_line("  MEMORY LEASE RECOVERY", f"Synced {temp_sync_count} temporary sessions to RAM", col1_w, col2_w)
+            save_db(db)
+        
+        if restore_count > 0:
+            print_dashboard_metric_line("  CORE MATRIX SECURITY", f"Sync Complete: {restore_count} DB Blacklist restored", col1_w, col2_w)
+        else:
+            print_dashboard_metric_line("  CORE MATRIX SECURITY", "Sync Complete: Permanent DB aligned", col1_w, col2_w)
+    return True
+
+def load_blocked_ips():
+    global blocked_ips
+    pfsense_table_ips = fetch_pfsense_table_ips()
+    if pfsense_table_ips is not None:
+        for ip in pfsense_table_ips:
+            blocked_ips.add(ip)
+
+# =======================================================================
+# UPGRADED FORENSIC ENGINE: LIVE DATA DIFF IDENTIFIER (REFRACTION STANDARD)
+# =======================================================================
+
+def run_forensic_diff_audit(backup_data, tampered_data):
+    """
+    Analyzes and pinpoint tracks exact unauthorized changes within the asset tracking
+    database using corporate-standard security incident logging signatures.
+    """
+    print("-" * 80)
+    print("\033[91m[SEC-CRIT-01] SECURE DATA STORE BYPASS DETECTED")
+    print("LOG_SOURCE: Deep Cryptographic Forensics Diff Audit Engine\033[0m")
+    print("-" * 80)
+
+    # 1. Audit altered properties or deleted targets from high-integrity node
+    for ip, backup_metrics in backup_data.items():
+        if ip in tampered_data:
+            live_metrics = tampered_data[ip]
+            for key, original_val in backup_metrics.items():
+                current_val = live_metrics.get(key)
+                if current_val != original_val:
+                    print(f"\033[93m[AUDIT_TARGET] : Target Host IP -> {ip}\033[0m")
+                    print(f"\033[91m[FIELD_TAMPER] : Modified Attribute -> '{key}'\033[0m")
+                    print(f"  [BASELINE_STATE] : {original_val}")
+                    print(f"  [CURRENT_STATE]  : \033[91m{current_val} (UNAUTHORIZED_MODIFICATION)\033[0m")
+                    print("." * 80)
+        else:
+            print(f"\033[93m[AUDIT_TARGET] : Target Host IP -> {ip}\033[0m")
+            print(f"\033[91m[DATA_DROPPED] : Integrity Baseline parameters completely REMOVED by attacker!\033[0m")
+            print("." * 80)
+
+    # 2. Audit if attacker dropped injected rogue persistence backdoors or testing IPs
+    for ip in tampered_data:
+        if ip not in backup_data:
+            print(f"\033[93m[AUDIT_TARGET] : Unknown Host Discovery -> {ip}\033[0m")
+            print(f"\033[91m[ROGUE_INJECT] : Cryptographic signature anomaly - Un-audited persistence trace found!\033[0m")
+            print(f"  [PAYLOAD_DATA] : {tampered_data[ip]}")
+            print("." * 80)
+
+    print("-" * 80)
+
+# =======================================================================
+# ATTACKER DATABASE AUTO-HEAL RECOVERY INFRASTRUCTURE (UPGRADED CORE)
+# =======================================================================
+
+def heal_database_pipeline():
+    log("[AUTO-HEAL TRIGGERED] Asset tracking database lost or compromised! Initiating structural rescue...")
+    
+    if os.path.exists(BACKUP_FILE):
+        try:
+            with open(BACKUP_FILE, "r") as f:
+                backup_data = json.load(f)
+                if isinstance(backup_data, dict):
+                    log("[STATUS - RESTORED] High-integrity cold backup located. Re-seeding structural fields.")
+                    with open(DB_FILE, "w") as main_f:
+                        json.dump(backup_data, main_f, indent=4)
+                    generate_hmac()
+                    enforce_file_security(DB_FILE)
+                    enforce_file_security(BACKUP_FILE)
+                    return backup_data
+        except Exception as e:
+            log(f"[WARN] Secondary backup node layer verification failure: {e}")
+
+    log("[CRITICAL SYSTEM VOID] Backup data compromised. Fetching current states from pfSense tables...")
+    pfsense_ips = fetch_pfsense_table_ips()
+    rebuilt_records = {}
+    
+    if pfsense_ips:
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for ip in pfsense_ips:
+            rebuilt_records[ip] = {
+                "attack_count": 1,
+                "threat_score": 20, 
+                "last_attack": "RECOVERED VIA FIREWALL SYNC",
+                "previous_attacks": [],
+                "first_seen": now_str,
+                "last_seen": now_str,
+                "status": "BLOCKED",
+                "block_type": "PERMANENT",
+                "blocked_until": None,
+                "attacker_os": "UNKNOWN",
+                "country": "UNKNOWN",
+                "isp": "UNKNOWN",
+                "vpn": False,
+                "tor": False,
+                "abuse_score": 0
+            }
+            
+    with open(DB_FILE, "w") as f_main:
+        json.dump(rebuilt_records, f_main, indent=4)
+    with open(BACKUP_FILE, "w") as f_back:
+        json.dump(rebuilt_records, f_back, indent=4)
+        
+    generate_hmac()
+    enforce_file_security(DB_FILE)
+    enforce_file_security(BACKUP_FILE)
+    log("[STATUS - RESTORED] Hard-recovery structural matrices seeded from pfSense tables successfully.")
+    return rebuilt_records
+
+def load_db():
+    global dashboard_fully_drawn
+    enforce_file_security(DB_FILE)
+    enforce_file_security(BACKUP_FILE)
+    
+    
+    if not verify_hmac() or not os.path.exists(DB_FILE):  
+        log("[INTEGRITY ALERT] Missing database or HMAC validation signature fracture!")  
+        
+        
+        if os.path.exists(DB_FILE) and os.path.exists(BACKUP_FILE):
+            try:
+                with open(DB_FILE, "r") as f_curr, open(BACKUP_FILE, "r") as f_back:
+                    tampered_raw = json.load(f_curr)
+                    clean_backup = json.load(f_back)
+                    
+                    
+                    if dashboard_fully_drawn:
+                        run_forensic_diff_audit(clean_backup, tampered_raw)
+                    else:
+                        
+                        logging.warning("[CRITICAL-INTEGRITY] Tamper detected during startup frame initialization. Check audit file.")
+                        with open("sentinelx_security_audit.log", "a") as al_f:
+                            al_f.write(f"\n--- STARTUP FRAME INITIALIZATION TAMPER: {datetime.now()} ---\n")
+                            for ip, b_metrics in clean_backup.items():
+                                if ip in tampered_raw and tampered_raw[ip].get("threat_score") != b_metrics.get("threat_score"):
+                                    al_f.write(f"HOST IP: {ip} | EXPECTED VALUE: {b_metrics.get('threat_score')} | INJECTED CURRENT: {tampered_raw[ip].get('threat_score')}\n")
+            except Exception as fe:
+                log(f"[WARN] Forensic analyzer extraction lock failure: {fe}")
+
+        return heal_database_pipeline()  
+        
+    try:  
+        with open(DB_FILE, "r") as f:  
+            return json.load(f)  
+    except Exception as e:  
+        log(f"[WARN] Standard JSON Read stream error: {e}. Initiating automatic repair execution.")
+        return heal_database_pipeline()
+
+def save_db(db):
+    try:
+        with open(DB_FILE, "w") as f:  
+            json.dump(db, f, indent=4)  
+            f.flush()  
+            os.sync()  
+        generate_hmac()
+        
+        with open(BACKUP_FILE, "w") as f_backup:
+            json.dump(db, f_backup, indent=4)
+            f_backup.flush()
+            os.sync()
+            
+        enforce_file_security(DB_FILE)
+        enforce_file_security(BACKUP_FILE)
+    except Exception as e:
+        log(f"[ERROR] Critical Framework Synchronous Storage Write Failure: {e}")
+
+# =========================
+# REAL OSINT LOOKUP ENGINE
+# =========================
+
+def osint_lookup(ip):
+    if ip.startswith("192.168.") or ip.startswith("10.") or ip.startswith("172.") or ip == "127.0.0.1":
+        return {
+            "country": "LOCAL_LAB",
+            "isp": "INTERNAL_NET",
+            "vpn": False,
+            "tor": False,
+            "abuse_score": 0
+        }
+    
+    api_key = load_osint_key()
+    if not api_key:
+        return None
+        
+    try:
+        url = f"https://api.abuseipdb.com/api/v2/check?ipAddress={ip}"
+        req = urllib.request.Request(url)
+        req.add_header("Accept", "application/json")
+        req.add_header("Key", api_key)
+        
+        with urllib.request.urlopen(req, timeout=5) as response:
+            res_data = json.loads(response.read().decode())
+            data = res_data.get("data", {})
+            
+            result = {
+                "country": data.get("countryCode", "UNKNOWN"),
+                "isp": data.get("isp", "UNKNOWN"),
+                "vpn": data.get("isPublicProxy", False),
+                "tor": data.get("isTorExitNode", False),
+                "abuse_score": data.get("abuseConfidenceScore", 0)
+            }
+            return result
+    except:
+        return {
+            "country": "ERROR",
+            "isp": "FETCH_FAILED",
+            "vpn": False,
+            "tor": False,
+            "abuse_score": 0
+        }
+
+# =======================================================================
+# CUSTOM COUNT-BASED ISOLATED WEIGHT UPDATER (UPGRADED FOR SEPARATE METRICS)
+# =======================================================================
+
+def update_attacker_db(ip, attack_type, action_status, assigned_score, static_weight, attacker_os="UNKNOWN"):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    with db_lock:  
+        db = load_db()  
+        
+        if ip not in db:  
+            db[ip] = {  
+                "attack_count": 1,  
+                "threat_score": assigned_score,  
+                "last_attack": attack_type,  
+                "previous_attacks": [],  
+                "first_seen": now,  
+                "last_seen": now,  
+                "status": "MONITOR" if action_status != "BLOCK" else "BLOCKED",  
+                "block_type": "NONE" if action_status != "BLOCK" else ("PERMANENT" if assigned_score >= PERMANENT_BLOCK_SCORE else "TEMPORARY"),  
+                "blocked_until": None,
+                "attacker_os": attacker_os,
+                "country": "UNKNOWN",
+                "isp": "UNKNOWN",
+                "vpn": False,
+                "tor": False,
+                "abuse_score": 0
+            }  
+        else:  
+            db[ip]["attack_count"] += 1  
+            
+            if "previous_attacks" not in db[ip]:
+                db[ip]["previous_attacks"] = []
+                
+            if db[ip]["last_attack"] not in db[ip]["previous_attacks"]:
+                db[ip]["previous_attacks"].append(db[ip]["last_attack"])
+                
+            db[ip]["threat_score"] = assigned_score  
+            db[ip]["last_attack"] = attack_type  
+            db[ip]["last_seen"] = now  
+            db[ip]["attacker_os"] = attacker_os
+            if action_status == "BLOCK":
+                db[ip]["status"] = "BLOCKED"
+                if assigned_score >= PERMANENT_BLOCK_SCORE:
+                    db[ip]["block_type"] = "PERMANENT"
+                else:
+                    db[ip]["block_type"] = "TEMPORARY"
+
+        if assigned_score < PERMANENT_BLOCK_SCORE:
+            volatile_score_history[ip] = assigned_score
+            log(f"[INFO] Processing Volatile Matrix Profile for IP: {ip} | Temporary Score Tracked: {static_weight}")
+        else:
+            log(f"[WARN] Repeat Critical Attacker upgraded to Blacklist Database: {ip}")  
+            
+        log(f"[METRIC] Action Status Matrix : {action_status} | Persistent Tracker Threat Score : {db[ip]['threat_score']}")  
+        log(f"[METRIC] Total Incident Count : {db[ip]['attack_count']}")  
+        save_db(db)  
+        time.sleep(0.5)
+
+# =========================
+# AUTO UNBLOCK ENGINE
+# =========================
+
+def unblock_ip(ip):
+    global blocked_ips  
+    with block_lock:  
+        try:  
+            cmd = f"""
+ssh -i {ssh_key} -o StrictHostKeyChecking=no \
+{pfsense_user}@{pfsense_ip} \
+'pfctl -t attackers -T delete {ip} && pfctl -k {ip} && pfctl -k 0.0.0.0/0 -k {ip}'
+"""
+            subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)  
+            time.sleep(1)  
+            if ip in blocked_ips:  
+                blocked_ips.remove(ip)  
+            
+            if ip in volatile_temp_blocks:
+                del volatile_temp_blocks[ip]
+                
+            with db_lock:  
+                db = load_db()  
+                if ip in db:  
+                    db[ip]["status"] = "UNBLOCKED"  
+                    db[ip]["block_type"] = "NONE"  
+                    db[ip]["blocked_until"] = None  
+                    save_db(db)  
+            log(f"[INFO] Auto unblocked & flushed connections for: {ip}")  
+        except Exception as e:  
+            log(f"[ERROR] UNBLOCK ERROR : {e}")
+
+# =================================================================================
+# AUTO UNBLOCK & REAL-TIME RUNTIME BLACKLIST INTEGRITY WATCHDOG ENGINE
+# =================================================================================
+
+def auto_unblock_engine():
+    global blocked_ips
+    while True:  
+        try:  
+            current_time = datetime.now()  
+            expired_temp_ips = []
+            
+            for ip, unblock_time_str in list(volatile_temp_blocks.items()):
+                unblock_time = datetime.strptime(unblock_time_str, "%Y-%m-%d %H:%M:%S")
+                if current_time >= unblock_time:
+                    expired_temp_ips.append(ip)
+            
+            for ip in expired_temp_ips:
+                log(f"[INFO] Volatile Lease Expired for Temporary IP Asset: {ip}")
+                unblock_ip(ip)
+                time.sleep(1)
+
+            with db_lock:  
+                db = load_db()  
+                
+            for ip, data in db.items():  
+                blocked_until = data.get("blocked_until")  
+                block_type = data.get("block_type")  
+                status = data.get("status")  
+                
+                if blocked_until and status == "BLOCKED" and block_type == "TEMPORARY":  
+                    unblock_time = datetime.strptime(blocked_until, "%Y-%m-%d %H:%M:%S")  
+                    if current_time >= unblock_time:  
+                        unblock_ip(ip)  
+                        time.sleep(1)
+
+            pfsense_live_ips = fetch_pfsense_table_ips()
+            if pfsense_live_ips is not None:
+                blocked_ips = pfsense_live_ips.copy()
+                
+                for ip, data in db.items():
+                    if data.get("block_type") == "PERMANENT" and data.get("status") == "BLOCKED":
+                        if ip not in pfsense_live_ips:
+                            log(f"[WATCHDOG ALARM] Permanent Blacklist IP {ip} detected MISSING from pfSense table during runtime!")
+                            log(f"[INFO] Re-enforcing immediate persistent block architecture for IP: {ip}")
+                            
+                            enforce_cmd = f"""
+ssh -i {ssh_key} -o StrictHostKeyChecking=no \
+{pfsense_user}@{pfsense_ip} \
+'pfctl -t attackers -T add {ip} && pfctl -k {ip} && pfctl -k 0.0.0.0/0 -k {ip}'
+"""
+                            subprocess.run(enforce_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            blocked_ips.add(ip)
+                            time.sleep(1)
+                            
+        except Exception as e:  
+            log(f"[ERROR] AUTO UNBLOCK & WATCHDOG ENGINE ERROR : {e}")  
+        time.sleep(10)
+
+# =========================
+# SURICATA LOG FINDER
+# =========================
+
+def get_suricata_log():
+    cmd = f"""
+ssh -i {ssh_key} -o StrictHostKeyChecking=no \
+{pfsense_user}@{pfsense_ip} \
+'find /var/log/suricata -name eve.json | head -n 1'
+"""
+    result = subprocess.check_output(  
+        cmd,  
+        shell=True,  
+        text=True  
+    ).strip()  
+    return result
+
+# =========================
+# MAC VALIDATOR
+# =========================
+
+def valid_mac(mac):
+    return re.match(  
+        r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$",  
+        mac.lower()  
+    )
+
+# =========================
+# GET GATEWAY MAC
+# =========================
+
+def get_gateway_mac():
+    try:  
+        output = subprocess.check_output(  
+            ["ip", "neigh", "show", gateway_ip]  
+        ).decode()  
+        if "lladdr" in output:  
+            mac = output.split("lladdr")[1].split()[0].lower()  
+            return mac  
+    except:  
+        return None
+
+# =========================
+# BLOCK MAC
+# =========================
+
+def block_mac(mac):
+    if mac in blocked_macs:  
+        return  
+    if not valid_mac(mac):  
+        return  
+    log(f"[INFO] Blocking attacker MAC : {mac}")  
+    os.system(f"ebtables -A INPUT -s {mac} -j DROP")  
+    time.sleep(1)  
+    os.system(f"ebtables -A FORWARD -s {mac} -j DROP")  
+    time.sleep(1)  
+    os.system(f"ebtables -A OUTPUT -s {mac} -j DROP")  
+    time.sleep(1)  
+    blocked_macs.add(mac)
+
+# ==================================
+# BLOCK IP (DYNAMIC JAIL ROUTER)
+# ==================================
+
+def block_ip(ip, target_score):
+    global blocked_ips, volatile_temp_blocks
+    with block_lock:  
+        if ip in blocked_ips:  
+            return  
+            
+        if target_score >= PERMANENT_BLOCK_SCORE:
+            block_type = "PERMANENT"
+            blocked_until = None
+        else:
+            block_type = "TEMPORARY"  
+            blocked_until = (  
+                datetime.now() +  
+                timedelta(seconds=TEMP_BLOCK_TIME)  
+            ).strftime("%Y-%m-%d %H:%M:%S")  
+        
+        log(f"[INFO] Blocking attacker IP via pfSense Firewall : {ip}")  
+        log(f"[INFO] Block Action Rule Type Determined : {block_type}")  
+        
+        cmd = f"""
+ssh -i {ssh_key} -o StrictHostKeyChecking=no \
+{pfsense_user}@{pfsense_ip} \
+'pfctl -t attackers -T add {ip} && pfctl -k {ip} && pfctl -k 0.0.0.0/0 -k {ip}'
+"""
+        subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)  
+        log(f"[INFO] Active connections and states successfully terminated for: {ip}")
+        time.sleep(1)  
+        blocked_ips.add(ip)  
+
+        if block_type == "TEMPORARY":
+            volatile_temp_blocks[ip] = blocked_until
+            log(f"[INFO] Volatile Storage Logged: {ip} tracked in memory until {blocked_until}.")
+            
+        with db_lock:  
+            db = load_db()
+            if ip in db:
+                db[ip]["status"] = "BLOCKED"  
+                db[ip]["block_type"] = block_type  
+                db[ip]["blocked_until"] = blocked_until  
+                save_db(db)  
+        log(f"[INFO] Database Storage Logged: {ip} verified safely into signature structures.")
+            
+        time.sleep(0.5)
+
+# =========================
+# LOCK GATEWAY
+# =========================
+
+def lock_gateway():
+    log("[INFO] Locking real gateway MAC")  
+    os.system(f"ip neigh del {gateway_ip} dev {interface} 2>/dev/null")  
+    time.sleep(1)  
+    os.system(  
+        f"ip neigh replace {gateway_ip} "  
+        f"lladdr {real_mac} nud permanent dev {interface}"  
+    )  
+    time.sleep(LOCK_DELAY)
+
+# =========================
+# VERIFY NETWORK
+# =========================
+
+def verify_network():
+    log("[INFO] Verifying network architecture baseline state")  
+    time.sleep(VERIFY_DELAY)  
+    os.system(f"ping -c 2 {gateway_ip}")  
+    time.sleep(1)  
+    os.system(f"ip neigh show {gateway_ip}")  
+    time.sleep(1)  
+    log("[INFO] Gateway Baseline Verified Safe")
+
+# =========================
+# DHCP POOL SWITCH
+# =========================
+
+def trigger_pool_switch():
+    global pool_switch_running  
+    if pool_switch_running:  
+        return  
+    pool_switch_running = True  
+    log("[INFO] Triggering Network Dynamic DHCP Pool Switch")  
+    cleanup = f"""
+ssh -i {ssh_key} -o StrictHostKeyChecking=no \
+{pfsense_user}@{pfsense_ip} \
+'rm -f /root/pool_switch_done'
+"""
+    subprocess.run(cleanup, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)  
+    time.sleep(2)  
+    cmd = f"""
+ssh -i {ssh_key} -o StrictHostKeyChecking=no \
+{pfsense_user}@{pfsense_ip} \
+'sh {pool_switch_script}'
+"""
+    subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)  
+    time.sleep(5)  
+    
+    save_current_state("Pool B")
+    pool_switch_running = False
+
+# =========================
+# RENEW IP
+# =========================
+
+def renew_ip():
+    log("[INFO] Renewing core client IP lease configuration")  
+    os.system(f"dhclient -r {interface}")  
+    time.sleep(3)  
+    os.system(f"dhclient -v {interface}")  
+    time.sleep(DHCP_DELAY)
+
+# =================================================================
+# ARP ENGINE
+# =================================================================
+
+def arp_engine():
+    global arp_recovery_mode  
+    last_arp_state = None  
+    
+    while True:  
+        try:  
+            current_mac = get_gateway_mac()  
+            if not current_mac or not valid_mac(current_mac):  
+                time.sleep(MONITOR_INTERVAL)  
+                continue  
+                
+            if current_mac == real_mac:  
+                if last_arp_state != "SAFE":
+                    log("[INFO] Gateway MAC Safe (Monitoring Active)")  
+                    last_arp_state = "SAFE"
+                time.sleep(MONITOR_INTERVAL)  
+                continue  
+            
+            arp_recovery_mode = True  
+            last_arp_state = "SPOOFED"
+            log("[WARN] ===== ARP SPOOF DETECTED =====")  
+            log(f"[INFO] Rogue MAC Ident : {current_mac}")  
+            block_mac(current_mac)  
+            time.sleep(2)  
+            lock_gateway()  
+            time.sleep(2)  
+            verify_network()  
+            time.sleep(2)  
+            trigger_pool_switch()  
+            time.sleep(2)  
+            renew_ip()  
+            time.sleep(2)  
+            lock_gateway()  
+            time.sleep(2)  
+            verify_network()  
+            time.sleep(2)  
+            log("[INFO] Defense mitigation cycle completed successfully")  
+            arp_recovery_mode = False  
+            time.sleep(ATTACK_COOLDOWN)  
+        except Exception as e:  
+            log(f"[ERROR] ARP ENGINE SYSTEM FAILURE : {e}")  
+            time.sleep(5)
+
+# ==================================================================================
+# IDS / IPS ENGINE (FIXED STATE PERSISTENCE LAB ENGINEERING)
+# ==================================================================================
+
+def ids_engine():
+    global arp_recovery_mode, alert_tracker  
+    while True:  
+        try:  
+            suricata_log = get_suricata_log()  
+            log("[INFO] Gateway MAC Safe (Monitoring Active)")
+            log("[INFO] IDS/IPS Engine Started Framework Pipeline")  
+            log(f"[INFO] Monitoring Feed Stream : {suricata_log}")  
+            cmd = f"""
+ssh -i {ssh_key} -o StrictHostKeyChecking=no \
+{pfsense_user}@{pfsense_ip} \
+'tail -n 0 -F {suricata_log}'
+"""
+            process = subprocess.Popen(  
+                cmd,  
+                shell=True,  
+                stdout=subprocess.PIPE,  
+                stderr=subprocess.PIPE,  
+                text=True  
+            )  
+            while True:  
+                line = process.stdout.readline()  
+                if not line:  
+                    continue  
+                
+                clean_line = line.strip()
+                if not clean_line.startswith("{") or not clean_line.endswith("}"):
+                    continue  
+                
+                try:  
+                    if arp_recovery_mode:  
+                        continue  
+                    data = json.loads(clean_line)  
+                    if data.get("event_type") != "alert":  
+                        continue  
+                    src_ip = data.get("src_ip")  
+                    dest_ip = data.get("dest_ip")  
+                    if not src_ip:  
+                        continue  
+                    own_ip = get_own_ip()  
+                    ignored_ips = [  
+                        gateway_ip,  
+                        "127.0.0.1",  
+                        own_ip  
+                    ]  
+                    if src_ip in ignored_ips:  
+                        continue  
+                    if src_ip in blocked_ips:  
+                        if src_ip not in ignored_attackers:  
+                            log(f"[INFO] Already blocked attacker ignored : {src_ip}")  
+                            ignored_attackers.add(src_ip)  
+                        continue  
+                    signature = data["alert"]["signature"]  
+                    
+                    ignored_alerts = [  
+                        "SURICATA STREAM",  
+                        "retransmission",  
+                        "Generic Protocol Command Decode"  
+                    ]  
+                    skip = False  
+                    for x in ignored_alerts:  
+                        if x.lower() in signature.lower():  
+                            skip = True  
+                            break  
+                    if skip:  
+                        continue  
+                    
+                    current_attacker = f"{src_ip}"  
+                    current_time = time.time()  
+                    
+                    with db_lock:
+                        temp_db = load_db()
+                        db_count = temp_db.get(src_ip, {}).get("attack_count", 0)
+                        old_score = temp_db.get(src_ip, {}).get("threat_score", 0)
+                        
+                        if old_score == 0 and src_ip in volatile_score_history:
+                            old_score = volatile_score_history[src_ip]
+
+                    if current_attacker not in alert_tracker:  
+                        alert_tracker[current_attacker] = {  
+                            "count": db_count + 1,  
+                            "time": current_time  
+                        }  
+                    else:  
+                        alert_tracker[current_attacker]["count"] += 1  
+                        alert_tracker[current_attacker]["time"] = current_time  
+                    
+                    count = alert_tracker[current_attacker]["count"]  
+                    attack_type = "UNKNOWN"  
+                    sig_lower = signature.lower()
+
+                    if "port scan" in sig_lower or "nmap scan" in sig_lower or "fingerprint" in sig_lower:
+                        attack_type = "PORT SCAN"
+                    elif "syn scan" in sig_lower:  
+                        attack_type = "TCP SYN SCAN"  
+                    elif "icmp" in sig_lower or "ping" in sig_lower and "scan" in sig_lower:
+                        attack_type = "ICMP SCAN"
+                    elif "http scan" in sig_lower or "nikto" in sig_lower or "dirb" in sig_lower:
+                        attack_type = "HTTP SCAN"
+
+                    elif "bruteforce" in sig_lower or ("brute" in sig_lower and ("force" in sig_lower or "login" in sig_lower or "failed" in sig_lower)):
+                        if "ssh" in sig_lower or "22" in sig_lower:
+                            attack_type = "SSH BRUTEFORCE"
+                        elif "ftp" in sig_lower or "21" in sig_lower:
+                            attack_type = "FTP BRUTEFORCE"
+                        elif "rdp" in sig_lower or "3389" in sig_lower:
+                            attack_type = "RDP BRUTEFORCE"
+                        elif "telnet" in sig_lower or "23" in sig_lower:
+                            attack_type = "TELNET BRUTEFORCE"
+                        else:
+                            attack_type = "PORT SCAN"  
+
+                    elif "dns" in sig_lower and "tunnel" in sig_lower:  
+                        attack_type = "DNS TUNNELING"  
+                    elif "smb" in sig_lower or "445" in sig_lower:  
+                        attack_type = "SMB ATTACK"  
+                    elif "mysql" in sig_lower or "3306" in sig_lower:  
+                        attack_type = "MYSQL ATTACK"  
+                    elif "postgresql" in sig_lower or "5432" in sig_lower:  
+                        attack_type = "POSTGRESQL ATTACK"  
+                    elif "vnc" in sig_lower or "5900" in sig_lower:  
+                        attack_type = "VNC ATTACK"  
+                    elif "redis" in sig_lower or "6379" in sig_lower:  
+                        attack_type = "REDIS ATTACK"  
+                    elif "mongodb" in sig_lower or "27017" in sig_lower:  
+                        attack_type = "MONGODB ATTACK"  
+                    elif "smtp" in sig_lower or "25" in sig_lower:
+                        attack_type = "SMTP ATTACK"
+
+                    if attack_type == "UNKNOWN":  
+                        continue  
+
+                    mat_rules = THREAT_MATRIX.get(attack_type)
+                    severity = mat_rules["severity"]
+                    threat = mat_rules["threat"]
+                    static_weight = mat_rules["weight"] 
+
+                    if static_weight >= 20:
+                        action = "BLOCK"
+                        display_score = old_score + 20
+                    else:
+                        if count % 3 == 0:
+                            display_score = old_score + static_weight
+                            action = "BLOCK"
+                        else:
+                            display_score = old_score
+                            action = "MONITOR"
+
+                    ttl_value = data.get("ttl")
+                    if not ttl_value and "proto" in data:
+                        proto_data = data.get("proto")
+                        if isinstance(proto_data, dict):
+                            ttl_value = proto_data.get("ttl")
+
+                    if ttl_value and isinstance(ttl_value, (int, float)):
+                        if ttl_value <= 64:
+                            detected_os = "Linux / Kali Linux"
+                        elif ttl_value <= 128:
+                            detected_os = "Windows OS"
+                        else:
+                            detected_os = "Network Device / Cisco Router"
+                    else:
+                        detected_os = "Linux / Kali Linux"  
+
+                    update_attacker_db(src_ip, attack_type, action, display_score, static_weight, attacker_os=detected_os)  
+                    time.sleep(0.5)  
+
+                    
+                    res_country = "UNKNOWN"
+                    res_isp = "UNKNOWN"
+                    res_vpn = "False"
+                    res_tor = "False"
+                    res_abuse = "0"
+
+                    if action == "BLOCK" and display_score >= PERMANENT_BLOCK_SCORE:
+                        intel = osint_lookup(src_ip)
+                        if intel:
+                            res_country = intel["country"]
+                            res_isp = intel["isp"]
+                            res_vpn = str(intel["vpn"])
+                            res_tor = str(intel["tor"])
+                            res_abuse = str(intel["abuse_score"])
+                            with db_lock:
+                                db = load_db()
+                                if src_ip in db:
+                                    db[src_ip]["country"] = intel["country"]
+                                    db[src_ip]["isp"] = intel["isp"]
+                                    db[src_ip]["vpn"] = intel["vpn"]
+                                    db[src_ip]["tor"] = intel["tor"]
+                                    db[src_ip]["abuse_score"] = intel["abuse_score"]
+                                    save_db(db)
+
+                    with db_lock:
+                        hist_db = load_db()
+                        history_list = hist_db.get(src_ip, {}).get("previous_attacks", [])
+                        history_string = ", ".join(history_list) if history_list else "NONE (FIRST TIME ATTACK)"
+
+                    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [ALERT] SECURITY EVENT INTERCEPTED")  
+                    print(f"Attack Type : {attack_type}")  
+                    print(f"Attacker IP : {src_ip}")  
+                    print(f"Attacker OS : {detected_os}")
+                    print(f"Target IP   : {dest_ip}")  
+                    print(f"Signature   : {signature}")  
+                    print(f"Severity    : {severity} (JUDICIAL CUSTOM)")  
+                    print(f"Threat LEVEL: {threat}")  
+                    print(f"Action Exec : {action}")  
+                    print(f"History     : {history_string}") 
+                    print(f"AbuseIPDB Country : {res_country}")
+                    print(f"AbuseIPDB ISP     : {res_isp}")
+                    print(f"AbuseIPDB VPN/TOR : {res_vpn} / {res_tor}")
+                    print(f"AbuseIPDB Score   : {res_abuse}%")
+                    print(f"Temporary Score Tracked            : {static_weight}")
+                    print(f"Persistent Tracker Threat Score    : {display_score}")
+                    print(f"Host Count  : {count} | Total Persistent Accumulative Score: {display_score}")  
+
+                    with open(LOG_FILE, "a") as f:  
+                        f.write(f"""
+====================================================
+TIME        : {datetime.now()}
+ATTACK TYPE : {attack_type}
+ATTACKER IP : {src_ip}
+ATTACKER OS : {detected_os}
+TARGET IP   : {dest_ip}
+SIGNATURE   : {signature}
+SEVERITY    : {severity}
+THREAT      : {threat}
+ACTION      : {action}
+HISTORY     : {history_string}
+ABUSEIPDB COUNTRY  : {res_country}
+ABUSEIPDB ISP      : {res_isp}
+ABUSEIPDB VPN/TOR  : {res_vpn} / {res_tor}
+ABUSEIPDB SCORE    : {res_abuse}%
+COUNT       : {count}
+TEMPORARY TRACKED SCORE  : {static_weight}
+PERSISTENT THREAT SCORE  : {display_score}
+TOTAL ACCUMULATIVE SCORE : {display_score}
+====================================================
+""")
+                    if action == "BLOCK":  
+                        block_ip(src_ip, display_score)  
+                        time.sleep(1)  
+                except Exception as e:  
+                    continue  
+        except Exception as e:  
+            time.sleep(IDS_RECONNECT_DELAY)
+
+# =======================================================================
+# MAIN INITIALIZATION BLOCK
+# =======================================================================
+
+if __name__ == "__main__":
+    os.system('clear')
+    
+    if os.geteuid() != 0:
+        print("\n\033[91m[ERROR]: SentinelX core subsystems require active root context layout bindings.")
+        print("Execute binary utilizing secure elements: 'sudo python3 sentinelx.py'\n\033[0m")
+        sys.exit(1)
+        
+    active_runtime_pool = load_previous_state()
+    db_integrity_string = check_db_integrity_status()
+    
+    suricata_path_log = "Locating Endpoint Log File..."
+    try:
+        suricata_path_log = get_suricata_log()
+    except:
+        suricata_path_log = "/var/log/suricata/eve.json"
+
+    term_width = shutil.get_terminal_size(fallback=(80, 24)).columns
+    if term_width < 85:
+        term_width = 85  
+
+    print("\033[91m┌" + "─" * (term_width - 2) + "┐")
+    
+    ascii_art = [
+        "███████╗███████╗███╗   ██╗████████╗██╗███╗   ██╗███████╗██╗     ██╗  ██╗",
+        "██╔════╝██╔════╝████╗  ██║╚══██╔══╝██║████╗  ██║██╔════╝██║     ╚██╗██╔╝",
+        "███████╗█████╗  ██╔██╗ ██║   ██║   ██║██╔██╗ ██║█████╗  ██║      ╚███╔╝ ",
+        "╚════██║██╔══╝  ██║╚██╗██║   ██║   ██║██║╚██╗██║██╔══╝  ██║      ██╔██╗ ",
+        "███████║███████╗██║ ╚████║   ██║   ██║██║ ╚████║███████╗███████╗██╔╝ ██╗",
+        "╚══════╝╚══════╝╚═╝  ╚═══╝   ╚═╝   ╚═╝╚═╝  ╚═══╝╚══════╝╚══════╝╚═╝  ╚═╝"
+    ]
+    
+    for i, line in enumerate(ascii_art):
+        color = "\033[92m" if i < 3 else "\033[91m"
+        padding = (term_width - 2 - len(line)) // 2
+        right_padding = term_width - 2 - len(line) - padding
+        print(f"\033[91m│{color}" + " " * padding + line + " " * right_padding + "\033[91m│")
+        
+    print("\033[91m├" + "─" * (term_width - 2) + "┤")
+    
+    sys_raw = "  [ SYSTEM TYPE ] : CORE AUTOMATED INTRUSION PREVENTION SYSTEM"
+    eng_raw = f"  [ ENGINE v2.6 ] : HYBRID CRITICAL BLOCK MODE (ACTIVE POOL: {active_runtime_pool})"
+    
+    print(f"\033[91m│\033[96m{sys_raw:<{term_width-2}}\033[91m│")
+    print(f"\033[91m│\033[96m{eng_raw:<{term_width-2}}\033[91m│")
+    print("\033[91m└" + "─" * (term_width - 2) + "┘\033[0m")
+
+    col1_w = 35  
+    col2_w = term_width - col1_w - 3  
+
+    print("\033[93m┌" + "─" * col1_w + "┬" + "─" * col2_w + "┐")
+    print(f"\033[93m│\033[33m {'METRIC PROFILE':<{col1_w-1}}\033[93m│\033[33m {'TARGET VALUE':<{col2_w-1}}\033[93m│")
+    print("\033[93m├" + "─" * col1_w + "┼" + "─" * col2_w + "┤\033[0m")
+    
+    metrics_data = [
+        ("  TARGET MONITOR INTERFACE", f"{interface}"),
+        ("  FIREWALL GATEWAY IP", f"{pfsense_ip}"),
+        ("  PROTECTED GATEWAY MAC", f"{real_mac}"),
+        ("  THREAT EVALUATION MATRIX", f"LOADED HYBRID HYPER-ANALYST RATIO"),
+        ("  VOLATILE STATE TRACKER", f"ACTIVE CONTINUATION ({active_runtime_pool})"),
+        ("  DATABASE INTEGRITY", f"{db_integrity_string}")
+    ]
+
+    for label, val in metrics_data:
+        print_dashboard_metric_line(label, val, col1_w, col2_w)
+        
+    print_dashboard_metric_line("  SENTINELX CORE STATUS", "Engaged Active Initialization Sequence...", col1_w, col2_w)
+    print_dashboard_metric_line("  RUNTIME SEGMENT LEASE", "Continuing metric sequence execution tracking...", col1_w, col2_w)
+    
+    # -----------------------------------------------------------------
+    # CRITICAL FIX: Safe inline database loading inside dashboard layout
+    # -----------------------------------------------------------------
+    sync_success = load_blocked_ips_dashboard(col1_w, col2_w)
+    
+    print_dashboard_metric_line("  ENGINE GATEWAY VALIDATION", "Gateway MAC Safe (Monitoring Active)", col1_w, col2_w)
+    print_dashboard_metric_line("  IDS/IPS DETECTION PIPELINE", "IDS/IPS Engine Active and Ready", col1_w, col2_w)
+    print_dashboard_metric_line("  SURICATA MONITOR FEED", f"Monitoring: {suricata_path_log}", col1_w, col2_w)
+    
+    print("\033[93m└" + "─" * col1_w + "┴" + "─" * col2_w + "┘\033[0m")
+    print("")
+
+    
+    dashboard_fully_drawn = True
+    time.sleep(0.1)
+
+    if not sync_success:
+        load_blocked_ips()
+
+    
+    arp_thread = threading.Thread(target=arp_engine)
+    ids_thread = threading.Thread(target=ids_engine)
+    unblock_thread = threading.Thread(target=auto_unblock_engine)
+
+    arp_thread.start()
+    time.sleep(0.2)
+    ids_thread.start()
+    time.sleep(0.2)
+    unblock_thread.start()
+
+    arp_thread.join()
+    ids_thread.join()
+    unblock_thread.join()
